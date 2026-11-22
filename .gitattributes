@@ -1,0 +1,36 @@
+# Store text files with LF line endings in the repository. Git converts them
+# to the platform's native line endings on checkout.
+* text=auto
+
+# Windows-only formats that must keep CRLF line endings on every platform.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.sln  text eol=crlf
+
+# Registry files are often UTF-16, which line-ending conversion would corrupt.
+*.reg  -text
+
+# Binaries: never convert or diff.
+*.exe  binary
+*.dll  binary
+*.asi  binary
+*.so   binary
+*.pdb  binary
+*.zip  binary
+*.7z   binary
+*.rar  binary
+*.pak  binary
+*.bin  binary
+*.dat  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.dds  binary
+*.tga  binary
+*.bmp  binary
+*.ico  binary
+*.wav  binary
+*.ogg  binary
+*.mp3  binary
+*.ttf  binary
+*.otf  binary
