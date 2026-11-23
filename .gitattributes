@@ -16,6 +16,13 @@
 *.asi  binary
 *.so   binary
 *.pdb  binary
+*.lib  binary
+*.pyd  binary
+*.pyc  binary
+*.npy  binary
+*.npz  binary
+*.pkl  binary
+*.gz   binary
 *.zip  binary
 *.7z   binary
 *.rar  binary

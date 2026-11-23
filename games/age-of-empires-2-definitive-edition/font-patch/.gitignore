@@ -1,0 +1,8 @@
+# Created on first run on each computer: the downloaded Python runtime,
+# and backups of the game's original font files plus cached builds.
+/runtime/
+/runtime.partial/
+/cache/
+
+__pycache__/
+*.pyc
