@@ -7,6 +7,9 @@
 *.cmd  text eol=crlf
 *.sln  text eol=crlf
 
+# Game config files: keep CRLF like the games' own INI files.
+*.ini  text eol=crlf
+
 # Registry files are often UTF-16, which line-ending conversion would corrupt.
 *.reg  -text
 

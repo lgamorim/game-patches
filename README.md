@@ -36,6 +36,7 @@ Naming:
 ## Games
 
 - [Age of Empires II: Definitive Edition](games/age-of-empires-2-definitive-edition/)
+- [XCOM: Enemy Unknown](games/xcom-enemy-unknown/)
 
 ## Disclaimer
 
