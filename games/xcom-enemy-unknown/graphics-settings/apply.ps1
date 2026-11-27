@@ -2,23 +2,33 @@
 #
 #   apply.ps1 apply|restore|status [--game-dir <path>] [--target eu|ew] [--quiet]
 #
-# Merges settings.ini (an overlay of [Section] Key=Value lines) into the game's
-# Engine\Config\BaseEngine.ini:
+# Merges two overlays into each game's config files:
 #
-#   - an overlay key that exists in its section has its value replaced on that line;
-#   - a missing key is inserted after the last setting of its section;
-#   - a missing section is created at the end of the file.
+#   base-engine.ini     -> Engine\Config\BaseEngine.ini
+#   default-engine.ini  -> XComGame\Config\DefaultEngine.ini
+#
+# An overlay holds [Section] lines followed by one of two kinds of entries:
+#
+#   Key=Value        replaces the value on the key's line in that section; a missing key is
+#                    inserted after the section's last setting, and a missing section is
+#                    created at the end of the file;
+#   Key.Field=Value  changes one field inside the key's (Field=...,Field=...) value and leaves
+#                    the rest of the line as it is; it never inserts, so a missing key,
+#                    section or field is an error.
 #
 # Every other line stays byte-for-byte as it was, and the file keeps its encoding (byte
 # order mark, if any) and line endings.
 #
-# Safety:
+# Safety, for each file on its own:
 #   - nothing is written while XComGame.exe or XComEW.exe is running;
 #   - a backup is taken only of a stock file (none of the overlay values present), into
 #     backup\enemy-unknown\ or backup\enemy-within\ next to this script, never into the game;
 #   - a partially patched file is only touched when a backup already exists;
 #   - every write goes through a temporary file and is read back and verified;
 #   - restore copies the backup back and verifies it by SHA-256.
+#
+# The per-user XComEngine.ini in Documents\My Games is only ever read (by status): the game
+# rebuilds it from these files when they change.
 
 $SteamAppId = '200510'   # XCOM: Enemy Unknown on Steam; Enemy Within installs into its XEW folder.
 
@@ -193,11 +203,63 @@ function Get-SettingValue([string]$Content) {
     return ([regex]::Match($Content, '^[^=]*=(.*)$')).Groups[1].Value.Trim()
 }
 
+function Get-StructField([string]$Content, [string]$Field) {
+    # Finds Field in a line like Key=(A=1,Field=x,B=(C=2)) and returns where its value sits
+    # in the line. Only top-level fields count: nested (...) and "..." are skipped over.
+    $eq = $Content.IndexOf('=')
+    $open = $eq + 1
+    while ($open -lt $Content.Length -and [char]::IsWhiteSpace($Content[$open])) { $open++ }
+    if ($open -ge $Content.Length -or $Content[$open] -ne '(') { throw 'is not a (...) value' }
+
+    $depth = 0
+    $inQuotes = $false
+    $close = -1
+    $segmentStarts = New-Object 'System.Collections.Generic.List[int]'
+    $segmentEnds = New-Object 'System.Collections.Generic.List[int]'
+    $segmentStarts.Add($open + 1)
+    for ($i = $open; $i -lt $Content.Length; $i++) {
+        $c = $Content[$i]
+        if ($c -eq '"') { $inQuotes = -not $inQuotes; continue }
+        if ($inQuotes) { continue }
+        if ($c -eq '(') { $depth++ }
+        elseif ($c -eq ')') {
+            $depth--
+            if ($depth -eq 0) { $close = $i; break }
+        } elseif ($c -eq ',' -and $depth -eq 1) {
+            $segmentEnds.Add($i)
+            $segmentStarts.Add($i + 1)
+        }
+    }
+    if ($close -lt 0 -or $Content.Substring($close + 1).Trim() -ne '') { throw 'is not a (...) value' }
+    $segmentEnds.Add($close)
+
+    $found = New-Object 'System.Collections.Generic.List[object]'
+    for ($s = 0; $s -lt $segmentStarts.Count; $s++) {
+        $start = $segmentStarts[$s]
+        $segment = $Content.Substring($start, $segmentEnds[$s] - $start)
+        $m = [regex]::Match($segment, '^(\s*)([^=\s]+)(\s*=\s*)(.*?)\s*$', [Text.RegularExpressions.RegexOptions]::Singleline)
+        if ($m.Success -and $m.Groups[2].Value -ieq $Field) {
+            $valueStart = $start + $m.Groups[1].Length + $m.Groups[2].Length + $m.Groups[3].Length
+            $found.Add([pscustomobject]@{ Start = $valueStart; Length = $m.Groups[4].Length; Value = $m.Groups[4].Value })
+        }
+    }
+    if ($found.Count -eq 0) { throw "has no $Field field" }
+    if ($found.Count -gt 1) { throw "has $Field more than once (it appears $($found.Count) times)" }
+    return $found[0]
+}
+
+function Get-EntryLabel($Entry) {
+    if ($Entry.Field) { return "[$($Entry.Section)] $($Entry.Key).$($Entry.Field)" }
+    return "[$($Entry.Section)] $($Entry.Key)"
+}
+
 # --- Overlay ------------------------------------------------------------------------------
 
-function ConvertFrom-OverlayText([string]$Text) {
+function ConvertFrom-OverlayText([string]$Text, [string]$Label = 'overlay') {
     $entries = New-Object 'System.Collections.Generic.List[object]'
-    $seen = @{}
+    $seen = @{}       # section + key + field, to catch repeats
+    $wholeKeys = @{}  # section + key set as a whole
+    $fieldKeys = @{}  # section + key set by field
     $section = $null
     $number = 0
     foreach ($line in (Split-IniLines $Text)) {
@@ -209,31 +271,47 @@ function ConvertFrom-OverlayText([string]$Text) {
         }
         if ($content -match '^\s*$' -or $content -match '^\s*(;|#|//)') { continue }
         if ($line.Kind -ne 'setting') {
-            throw "settings.ini line ${number}: expected [Section], Key=Value or a ; comment, got '$content'."
+            throw "$Label line ${number}: expected [Section], Key=Value, Key.Field=Value or a ; comment, got '$content'."
         }
         if ($null -eq $section) {
-            throw "settings.ini line ${number}: '$content' comes before any [section]."
+            throw "$Label line ${number}: '$content' comes before any [section]."
         }
         $key = $line.Name
         if ($key -match '^[+\-.!]') {
-            throw "settings.ini line ${number}: '$key' uses UE3 array syntax (+, -, . or !), which this patch does not merge."
+            throw "$Label line ${number}: '$key' uses UE3 array syntax (+, -, . or !), which this patch does not merge."
         }
-        $id = "$section`n$key"
+        $field = $null
+        if ($key.Contains('.')) {
+            $parts = $key.Split('.')
+            if ($parts.Count -ne 2 -or -not $parts[0] -or -not $parts[1]) {
+                throw "$Label line ${number}: '$key' is not Key.Field (one key, one dot, one field name)."
+            }
+            $key = $parts[0]
+            $field = $parts[1]
+        }
+        $keyId = "$section`n$key"
+        $id = "$keyId`n$field"
         if ($seen.ContainsKey($id)) {
-            throw "settings.ini line ${number}: $key is set more than once in [$section]."
+            $name = if ($field) { "$key.$field" } else { $key }
+            throw "$Label line ${number}: $name is set more than once in [$section]."
+        }
+        if (($field -and $wholeKeys.ContainsKey($keyId)) -or (-not $field -and $fieldKeys.ContainsKey($keyId))) {
+            throw "$Label line ${number}: $key is set both as a whole and by field in [$section]."
         }
         $seen[$id] = $true
-        $entries.Add([pscustomobject]@{ Section = $section; Key = $key; Value = (Get-SettingValue $content) })
+        if ($field) { $fieldKeys[$keyId] = $true } else { $wholeKeys[$keyId] = $true }
+        $entries.Add([pscustomobject]@{ Section = $section; Key = $key; Field = $field; Value = (Get-SettingValue $content) })
     }
-    if ($entries.Count -eq 0) { throw 'settings.ini has no settings.' }
+    if ($entries.Count -eq 0) { throw "$Label has no settings." }
     return $entries.ToArray()
 }
 
 function Read-Overlay([string]$Path) {
+    $label = Split-Path -Leaf $Path
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "settings.ini not found: $Path"
+        throw "$label not found: $Path"
     }
-    return ConvertFrom-OverlayText (Read-IniFile $Path).Text
+    return ConvertFrom-OverlayText (Read-IniFile $Path).Text $label
 }
 
 # --- State and merge ----------------------------------------------------------------------
@@ -250,10 +328,19 @@ function Get-IniState([string]$Text, $Overlay) {
         if ($section) {
             $hits = Find-SettingLines $lines $section $entry.Key
             if ($hits.Count -eq 1) {
-                $ok = [string]::Equals((Get-SettingValue $lines[$hits[0]].Content), $entry.Value, [StringComparison]::Ordinal)
+                $content = $lines[$hits[0]].Content
+                if ($entry.Field) {
+                    # A value that is not a struct or lacks the field simply isn't patched;
+                    # the merge reports why if it is asked to change it.
+                    $current = $null
+                    try { $current = (Get-StructField $content $entry.Field).Value } catch { $current = $null }
+                } else {
+                    $current = Get-SettingValue $content
+                }
+                $ok = ($null -ne $current) -and [string]::Equals($current, $entry.Value, [StringComparison]::Ordinal)
             }
         }
-        if ($ok) { $present++ } else { $missing.Add("[$($entry.Section)] $($entry.Key)") }
+        if ($ok) { $present++ } else { $missing.Add((Get-EntryLabel $entry)) }
     }
     $state = 'partial'
     if ($present -eq 0) { $state = 'stock' }
@@ -269,6 +356,26 @@ function Merge-IniText([string]$Text, $Overlay) {
     foreach ($entry in @($Overlay)) {
         $section = Find-Section (Get-IniSections $lines) $entry.Section
         $newSetting = "$($entry.Key)=$($entry.Value)"
+
+        if ($entry.Field) {
+            # Field edits only change an existing line; they never insert.
+            $label = Get-EntryLabel $entry
+            if ($null -eq $section) { throw "$label`: section [$($entry.Section)] not found in the file." }
+            $hits = Find-SettingLines $lines $section $entry.Key
+            if ($hits.Count -eq 0) { throw "$label`: $($entry.Key) not found in [$($entry.Section)]." }
+            $index = $hits[0]
+            $old = $lines[$index]
+            try {
+                $spot = Get-StructField $old.Content $entry.Field
+            } catch {
+                throw "$label`: the value of $($entry.Key) $($_.Exception.Message)."
+            }
+            if (-not [string]::Equals($spot.Value, $entry.Value, [StringComparison]::Ordinal)) {
+                $content = $old.Content.Substring(0, $spot.Start) + $entry.Value + $old.Content.Substring($spot.Start + $spot.Length)
+                $lines[$index] = New-IniLine $content $old.Eol
+            }
+            continue
+        }
 
         if ($null -eq $section) {
             # New section at the end of the file, after a blank line.
@@ -306,6 +413,38 @@ function Merge-IniText([string]$Text, $Overlay) {
 
     if ($noFinalEol -and $lines.Count -gt 0) { $lines[$lines.Count - 1].Eol = '' }
     return Join-IniLines $lines
+}
+
+function Get-OverlayLineIndexes($Lines, $Overlay) {
+    # Line numbers of the settings this overlay edits (whole values or fields).
+    $indexes = New-Object 'System.Collections.Generic.HashSet[int]'
+    $sections = Get-IniSections $Lines
+    foreach ($entry in @($Overlay)) {
+        foreach ($section in @($sections | Where-Object { $_.Name -ieq $entry.Section })) {
+            for ($i = $section.Header + 1; $i -lt $section.End; $i++) {
+                if ($Lines[$i].Kind -eq 'setting' -and $Lines[$i].Name -ieq $entry.Key) { [void]$indexes.Add($i) }
+            }
+        }
+    }
+    return ,$indexes
+}
+
+function Test-OnlyOverlayLinesDiffer([string]$Text, [string]$BackupText, $Overlay) {
+    # True when Text is BackupText with other values on some of the lines this overlay
+    # edits and nothing else changed: the file was patched with other values for the same
+    # settings (for example by an earlier version of this patch), not updated by the game.
+    $current = Split-IniLines $Text
+    $backup = Split-IniLines $BackupText
+    if ($current.Count -ne $backup.Count) { return $false }
+    $targets = Get-OverlayLineIndexes $current $Overlay
+    $differs = $false
+    for ($i = 0; $i -lt $current.Count; $i++) {
+        if ($current[$i].Content -cne $backup[$i].Content -or $current[$i].Eol -cne $backup[$i].Eol) {
+            if (-not $targets.Contains($i) -or $current[$i].Name -ine $backup[$i].Name) { return $false }
+            $differs = $true
+        }
+    }
+    return $differs
 }
 
 function Update-IniFile([string]$Path, $Overlay) {
@@ -436,11 +575,12 @@ function Find-SteamInstall {
     return $null
 }
 
-function New-Target([string]$Key, [string]$File) {
+function New-Target([string]$Key, [string]$Root) {
+    # Root is the game's own folder: the install folder for Enemy Unknown, XEW for Enemy Within.
     if ($Key -eq 'eu') {
-        return [pscustomobject]@{ Key = 'eu'; Name = 'Enemy Unknown'; BackupName = 'enemy-unknown'; File = $File }
+        return [pscustomobject]@{ Key = 'eu'; Name = 'Enemy Unknown'; BackupName = 'enemy-unknown'; UserFolder = 'XCOM - Enemy Unknown'; Root = $Root }
     }
-    return [pscustomobject]@{ Key = 'ew'; Name = 'Enemy Within'; BackupName = 'enemy-within'; File = $File }
+    return [pscustomobject]@{ Key = 'ew'; Name = 'Enemy Within'; BackupName = 'enemy-within'; UserFolder = 'XCOM - Enemy Within'; Root = $Root }
 }
 
 function Resolve-Targets($Options) {
@@ -470,12 +610,12 @@ function Resolve-Targets($Options) {
 
     $isXew = ((Split-Path -Leaf $root) -ieq 'XEW') -or (Test-Path -LiteralPath (Join-Path $root 'Binaries\Win32\XComEW.exe') -PathType Leaf)
     if ($isXew) {
-        $targets = @(New-Target 'ew' $engineIni)
+        $targets = @(New-Target 'ew' $root)
         if ($Options.Target -eq 'eu') {
             throw "--target eu does not apply: '$root' is the XEW folder, which only holds Enemy Within. Point --game-dir at its parent folder."
         }
     } else {
-        $targets = @((New-Target 'eu' $engineIni), (New-Target 'ew' (Join-Path $root 'XEW\Engine\Config\BaseEngine.ini')))
+        $targets = @((New-Target 'eu' $root), (New-Target 'ew' (Join-Path $root 'XEW')))
         if ($Options.Target) { $targets = @($targets | Where-Object { $_.Key -eq $Options.Target }) }
     }
     return [pscustomobject]@{ Root = $root; Source = $source; Targets = $targets }
@@ -489,105 +629,167 @@ function Test-GameRunning {
 
 # --- Verbs --------------------------------------------------------------------------------
 
-function Get-BackupPath([string]$BackupRoot, $Target) {
-    return Join-Path (Join-Path $BackupRoot $Target.BackupName) 'BaseEngine.ini'
+function Get-GameFiles($Target, $Specs, [string]$BackupRoot) {
+    # One entry per config file this patch handles for one game.
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($spec in $Specs) {
+        $files.Add([pscustomobject]@{
+            Game        = $Target.Name
+            Name        = $spec.Name
+            Path        = Join-Path $Target.Root $spec.Relative
+            Overlay     = $spec.Overlay
+            Backup      = Join-Path (Join-Path $BackupRoot $Target.BackupName) $spec.Name
+            BackupLabel = "backup\$($Target.BackupName)\$($spec.Name)"
+        })
+    }
+    return ,$files
 }
 
-function Get-BackupLabel($Target) {
-    return "backup\$($Target.BackupName)\BaseEngine.ini"
+function Assert-FileExists($File) {
+    if (-not (Test-Path -LiteralPath $File.Path -PathType Leaf)) { throw "not found ($($File.Path))." }
 }
 
-function Invoke-ApplyTarget($Target, $Overlay, [string]$BackupRoot) {
-    $file = Read-IniFile $Target.File
-    $state = Get-IniState -Text $file.Text -Overlay $Overlay
-    $backup = Get-BackupPath $BackupRoot $Target
-    $hasBackup = Test-Path -LiteralPath $backup -PathType Leaf
+function Invoke-ApplyFile($File) {
+    # Returns whether it succeeded and whether it wrote to the game file.
+    Assert-FileExists $File
+    $data = Read-IniFile $File.Path
+    $state = Get-IniState -Text $data.Text -Overlay $File.Overlay
+    $hasBackup = Test-Path -LiteralPath $File.Backup -PathType Leaf
+    $name = $File.Name
 
     if ($state.State -eq 'patched') {
-        Write-Info '  already patched; nothing to do.'
-        if (-not $hasBackup) { Write-Info '  (no backup here: Restore will point you to Steam''s "Verify integrity of game files".)' }
-        return $true
+        Write-Info "  ${name}: already patched; nothing to do."
+        if (-not $hasBackup) { Write-Info "  ${name}: (no backup here: Restore will point you to Steam's `"Verify integrity of game files`".)" }
+        return [pscustomobject]@{ Ok = $true; Changed = $false }
     }
 
     if ($state.State -eq 'partial') {
         if (-not $hasBackup) {
-            Write-Problem ("$($Target.Name): BaseEngine.ini is partially patched ($($state.Present) of $($state.Total) settings) and there is no backup of the stock file. " +
+            Write-Problem ("$($File.Game): $name is partially patched ($($state.Present) of $($state.Total) settings) and there is no backup of the stock file. " +
                 'Refusing to change it, because Restore could not undo that afterwards. ' +
                 'Get the stock file back with Steam > right-click XCOM: Enemy Unknown > Properties > Installed Files > "Verify integrity of game files", then run Apply again.')
-            return $false
+            return [pscustomobject]@{ Ok = $false; Changed = $false }
         }
-        Write-Info "  partially patched ($($state.Present) of $($state.Total) settings); completing it. Keeping the existing backup."
+        Write-Info "  ${name}: partially patched ($($state.Present) of $($state.Total) settings); completing it. Keeping the existing backup."
     } else {
-        # Stock: back up exactly the bytes that were just classified.
-        $dir = Split-Path -Parent $backup
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Write-BytesAtomically $backup $file.Bytes
-        if ((Get-Sha256Hex ([IO.File]::ReadAllBytes($backup))) -ne (Get-Sha256Hex $file.Bytes)) {
-            throw "the backup $(Get-BackupLabel $Target) does not verify; nothing was changed in the game."
+        # Stock as far as this overlay can tell. If it differs from an existing backup only
+        # on the lines this patch edits, it holds other values for the same settings: backing
+        # it up would replace the real stock file, so stop instead.
+        if ($hasBackup) {
+            $backupData = Read-IniFile $File.Backup
+            if ((Get-Sha256Hex $backupData.Bytes) -ne (Get-Sha256Hex $data.Bytes) -and
+                (Test-OnlyOverlayLinesDiffer $data.Text $backupData.Text $File.Overlay)) {
+                Write-Problem ("$($File.Game): $name has other values for this patch's settings than the stock backup in $($File.BackupLabel), " +
+                    'for example from an earlier version of this patch. It was not backed up or changed. Run Restore.cmd first, then Apply.cmd.')
+                return [pscustomobject]@{ Ok = $false; Changed = $false }
+            }
         }
-        Write-Info "  backed up the stock file to $(Get-BackupLabel $Target)"
+        # Stock: back up exactly the bytes that were just classified.
+        $dir = Split-Path -Parent $File.Backup
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Write-BytesAtomically $File.Backup $data.Bytes
+        if ((Get-Sha256Hex ([IO.File]::ReadAllBytes($File.Backup))) -ne (Get-Sha256Hex $data.Bytes)) {
+            throw "the backup $($File.BackupLabel) does not verify; nothing was changed in the game."
+        }
+        Write-Info "  ${name}: backed up the stock file to $($File.BackupLabel)"
     }
 
-    $result = Update-IniFile -Path $Target.File -Overlay $Overlay
+    $result = Update-IniFile -Path $File.Path -Overlay $File.Overlay
     if ($result.Changed) {
-        Write-Info "  patched: $($state.Total - $state.Present) of $($state.Total) settings changed, all $($state.Total) verified."
+        Write-Info "  ${name}: patched: $($state.Total - $state.Present) of $($state.Total) settings changed, all $($state.Total) verified."
     }
-    return $true
+    return [pscustomobject]@{ Ok = $true; Changed = $result.Changed }
 }
 
-function Invoke-RestoreTarget($Target, $Overlay, [string]$BackupRoot) {
-    $file = Read-IniFile $Target.File
-    $state = Get-IniState -Text $file.Text -Overlay $Overlay
-    $backup = Get-BackupPath $BackupRoot $Target
+function Invoke-RestoreFile($File) {
+    Assert-FileExists $File
+    $data = Read-IniFile $File.Path
+    $state = Get-IniState -Text $data.Text -Overlay $File.Overlay
+    $name = $File.Name
 
-    if (-not (Test-Path -LiteralPath $backup -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $File.Backup -PathType Leaf)) {
         if ($state.State -eq 'stock') {
-            Write-Info '  already stock; nothing to restore.'
-            return $true
+            Write-Info "  ${name}: already stock; nothing to restore."
+            return [pscustomobject]@{ Ok = $true; Changed = $false }
         }
-        Write-Problem ("$($Target.Name): there is no backup in $(Get-BackupLabel $Target). " +
+        Write-Problem ("$($File.Game): there is no backup of $name in $($File.BackupLabel). " +
             'To get the stock file back: Steam > right-click XCOM: Enemy Unknown > Properties > Installed Files > "Verify integrity of game files".')
-        return $false
+        return [pscustomobject]@{ Ok = $false; Changed = $false }
     }
 
-    $backupBytes = [IO.File]::ReadAllBytes($backup)
+    $backupBytes = [IO.File]::ReadAllBytes($File.Backup)
     $backupHash = Get-Sha256Hex $backupBytes
-    if ((Get-Sha256Hex $file.Bytes) -eq $backupHash) {
-        Write-Info '  already matches the backup; nothing to restore.'
-        return $true
+    if ((Get-Sha256Hex $data.Bytes) -eq $backupHash) {
+        Write-Info "  ${name}: already matches the backup; nothing to restore."
+        return [pscustomobject]@{ Ok = $true; Changed = $false }
     }
     if ($state.State -eq 'stock') {
-        Write-Info '  already stock (none of the patch''s settings are present), so it is left as it is. The backup is older than this file, probably from before a game update.'
-        return $true
+        if (Test-OnlyOverlayLinesDiffer $data.Text (Read-IniFile $File.Backup).Text $File.Overlay) {
+            Write-Info "  ${name}: has other values for this patch's settings than the stock backup (for example from an earlier version of this patch); restoring the backup."
+        } else {
+            Write-Info "  ${name}: already stock (none of the patch's settings are present), so it is left as it is. The backup is older than this file, probably from before a game update."
+            return [pscustomobject]@{ Ok = $true; Changed = $false }
+        }
     }
-    $backupState = Get-IniState -Text (Read-IniFile $backup).Text -Overlay $Overlay
+    $backupState = Get-IniState -Text (Read-IniFile $File.Backup).Text -Overlay $File.Overlay
     if ($backupState.State -ne 'stock') {
-        Write-Problem ("$($Target.Name): $(Get-BackupLabel $Target) is not a stock file, so it is not restored. " +
+        Write-Problem ("$($File.Game): $($File.BackupLabel) is not a stock file, so it is not restored. " +
             'Use Steam''s "Verify integrity of game files" instead, then delete that backup.')
-        return $false
+        return [pscustomobject]@{ Ok = $false; Changed = $false }
     }
 
-    Write-BytesAtomically $Target.File $backupBytes
-    if ((Get-Sha256Hex ([IO.File]::ReadAllBytes($Target.File))) -ne $backupHash) {
+    Write-BytesAtomically $File.Path $backupBytes
+    if ((Get-Sha256Hex ([IO.File]::ReadAllBytes($File.Path))) -ne $backupHash) {
         throw 'the restored file does not match the backup. Use Steam''s "Verify integrity of game files" to recover.'
     }
-    Write-Info '  restored the stock file (SHA-256 verified).'
-    return $true
+    Write-Info "  ${name}: restored the stock file (SHA-256 verified)."
+    return [pscustomobject]@{ Ok = $true; Changed = $true }
 }
 
-function Get-StatusText($Target, $Overlay, [string]$BackupRoot) {
-    $state = Get-IniState -Text (Read-IniFile $Target.File).Text -Overlay $Overlay
+function Get-FileStatusText($File) {
+    if (-not (Test-Path -LiteralPath $File.Path -PathType Leaf)) { return "not found ($($File.Path))" }
+    $data = Read-IniFile $File.Path
+    $state = Get-IniState -Text $data.Text -Overlay $File.Overlay
+    $hasBackup = Test-Path -LiteralPath $File.Backup -PathType Leaf
     $text = switch ($state.State) {
         'stock'   { 'stock' }
         'patched' { 'patched' }
         default   { "partially patched ($($state.Present) of $($state.Total) settings)" }
     }
-    $backup = if (Test-Path -LiteralPath (Get-BackupPath $BackupRoot $Target) -PathType Leaf) { 'yes' } else { 'no' }
-    return "$text; backup: $backup"
+    # Same check as Apply and Restore: other values on exactly the lines this patch edits.
+    if ($state.State -eq 'stock' -and $hasBackup -and
+        (Test-OnlyOverlayLinesDiffer $data.Text (Read-IniFile $File.Backup).Text $File.Overlay)) {
+        $text = 'patched with other values (for example by an earlier version); run Restore.cmd, then Apply.cmd'
+    }
+    $backup = if ($hasBackup) { 'yes' } else { 'no' }
+    return "$text (backup: $backup)"
 }
 
-function Invoke-Main([string[]]$Arguments, [string]$OverlayPath, [string]$BackupRoot, [scriptblock]$IsGameRunning = { Test-GameRunning }) {
+function Get-UserConfigNote($Target, $Files, [string]$DocumentsRoot) {
+    # Only reads XComEngine.ini. The game rebuilds it when the files above change.
+    $path = Join-Path $DocumentsRoot "My Games\$($Target.UserFolder)\XComGame\Config\XComEngine.ini"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return 'not created yet; the game builds it from the files above on its next launch.'
+    }
+    $userTime = (Get-Item -LiteralPath $path).LastWriteTimeUtc
+    $newest = [datetime]::MinValue
+    foreach ($file in $Files) {
+        if (Test-Path -LiteralPath $file.Path -PathType Leaf) {
+            $time = (Get-Item -LiteralPath $file.Path).LastWriteTimeUtc
+            if ($time -gt $newest) { $newest = $time }
+        }
+    }
+    if ($userTime -lt $newest) {
+        return 'older than the files above; the game rebuilds it on its next launch, which resets your resolution and graphics options.'
+    }
+    return 'newer than the files above, so it already includes them. Changes made in the in-game Options are saved there and take precedence.'
+}
+
+function Invoke-Main([string[]]$Arguments, [string]$BaseEngineOverlayPath, [string]$DefaultEngineOverlayPath, [string]$BackupRoot,
+                     [string]$DocumentsRoot = [Environment]::GetFolderPath('MyDocuments'),
+                     [scriptblock]$IsGameRunning = { Test-GameRunning }) {
     $ErrorActionPreference = 'Stop'
+    $BaseEngineRelative = 'Engine\Config\BaseEngine.ini'
     $script:Quiet = $false
     try {
         $options = ConvertFrom-Arguments $Arguments
@@ -596,7 +798,10 @@ function Invoke-Main([string[]]$Arguments, [string]$OverlayPath, [string]$Backup
             Write-Host $Usage
             return 0
         }
-        $overlay = Read-Overlay $OverlayPath
+        $specs = @([pscustomobject]@{ Name = 'BaseEngine.ini'; Relative = $BaseEngineRelative; Overlay = (Read-Overlay $BaseEngineOverlayPath) })
+        if ($DefaultEngineOverlayPath) {
+            $specs += [pscustomobject]@{ Name = 'DefaultEngine.ini'; Relative = 'XComGame\Config\DefaultEngine.ini'; Overlay = (Read-Overlay $DefaultEngineOverlayPath) }
+        }
         $resolved = Resolve-Targets $options
 
         if ($options.Verb -eq 'status') {
@@ -611,11 +816,13 @@ function Invoke-Main([string[]]$Arguments, [string]$OverlayPath, [string]$Backup
         }
 
         $ok = $true
+        $changed = $false
         foreach ($target in $resolved.Targets) {
             $label = '{0,-14}' -f $target.Name
-            if (-not (Test-Path -LiteralPath $target.File -PathType Leaf)) {
+            $baseEngine = Join-Path $target.Root $BaseEngineRelative
+            if (-not (Test-Path -LiteralPath $baseEngine -PathType Leaf)) {
                 if ($options.Target) {
-                    Write-Problem "$($target.Name) is not installed (no $($target.File))."
+                    Write-Problem "$($target.Name) is not installed (no $baseEngine)."
                     $ok = $false
                 } elseif ($options.Verb -eq 'status') {
                     Write-Host "${label}: not installed"
@@ -624,22 +831,33 @@ function Invoke-Main([string[]]$Arguments, [string]$OverlayPath, [string]$Backup
                 }
                 continue
             }
-            try {
-                if ($options.Verb -eq 'status') {
-                    Write-Host "${label}: $(Get-StatusText $target $overlay $BackupRoot)"
-                    continue
+
+            $files = Get-GameFiles $target $specs $BackupRoot
+            if ($options.Verb -eq 'status') {
+                Write-Host $target.Name
+                foreach ($file in $files) {
+                    try { $text = Get-FileStatusText $file } catch { $text = "unreadable: $($_.Exception.Message)" }
+                    Write-Host ('  {0,-18}: {1}' -f $file.Name, $text)
                 }
-                Write-Info "${label}: $($target.File)"
-                if ($options.Verb -eq 'apply') {
-                    $done = Invoke-ApplyTarget $target $overlay $BackupRoot
-                } else {
-                    $done = Invoke-RestoreTarget $target $overlay $BackupRoot
-                }
-                if (-not $done) { $ok = $false }
-            } catch {
-                Write-Problem "$($target.Name): $($_.Exception.Message)"
-                $ok = $false
+                Write-Host ('  {0,-18}: {1}' -f 'XComEngine.ini', (Get-UserConfigNote $target $files $DocumentsRoot))
+                continue
             }
+
+            Write-Info "$($target.Name): $($target.Root)"
+            foreach ($file in $files) {
+                try {
+                    if ($options.Verb -eq 'apply') { $result = Invoke-ApplyFile $file } else { $result = Invoke-RestoreFile $file }
+                    if (-not $result.Ok) { $ok = $false }
+                    if ($result.Changed) { $changed = $true }
+                } catch {
+                    Write-Problem "$($target.Name), $($file.Name): $($_.Exception.Message)"
+                    $ok = $false
+                }
+            }
+        }
+        if ($changed) {
+            Write-Info ('Next time you start the game, it rebuilds your per-user settings (XComEngine.ini) from these files. ' +
+                'That resets your resolution and graphics options: set them again under Options.')
         }
         if ($ok) { return 0 }
         return 1
@@ -652,5 +870,6 @@ function Invoke-Main([string[]]$Arguments, [string]$OverlayPath, [string]$Backup
 # Run only when started as a script, not when dot-sourced by the tests.
 if ($MyInvocation.InvocationName -ne '.') {
     $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-    exit (Invoke-Main -Arguments $args -OverlayPath (Join-Path $here 'settings.ini') -BackupRoot (Join-Path $here 'backup'))
+    exit (Invoke-Main -Arguments $args -BaseEngineOverlayPath (Join-Path $here 'base-engine.ini') `
+        -DefaultEngineOverlayPath (Join-Path $here 'default-engine.ini') -BackupRoot (Join-Path $here 'backup'))
 }

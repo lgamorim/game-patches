@@ -20,4 +20,4 @@ Patches that edit files in the install folder should say so, because a game upda
 
 | Patch | Kind | Summary |
 |---|---|---|
-| [graphics-settings](graphics-settings/) | Mod | Raises the engine's graphics defaults (texture filtering, shadows, post-processing, draw distance, DirectX 11) in `BaseEngine.ini`, for both games |
+| [graphics-settings](graphics-settings/) | Mod | Raises the engine's graphics defaults (texture filtering, shadows, post-processing, draw distance, DirectX 11) in `BaseEngine.ini` and `DefaultEngine.ini`, for both games |

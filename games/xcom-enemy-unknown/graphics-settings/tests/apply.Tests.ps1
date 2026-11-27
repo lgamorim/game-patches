@@ -81,7 +81,7 @@ Describe 'graphics-settings apply.ps1' {
             'MaxAnisotropy=16'
         ))
 
-        # A small file shaped like BaseEngine.ini, and an overlay shaped like settings.ini.
+        # A small file shaped like BaseEngine.ini, and an overlay shaped like base-engine.ini.
         $script:StockLines = @(
             '[Engine.Engine]',
             'Language=INT',
@@ -148,34 +148,81 @@ Describe 'graphics-settings apply.ps1' {
         )
         $script:Overlay = ConvertFrom-OverlayText $script:OverlayText
 
-        # Fake install: <root>\Engine\Config\BaseEngine.ini and <root>\XEW\Engine\Config\BaseEngine.ini.
-        function New-FakeInstall([switch]$NoXew, [string]$EuText, [string]$EwText) {
+        # A small file shaped like XComGame\Config\DefaultEngine.ini (it starts with a blank
+        # line, like the real one), and an overlay shaped like default-engine.ini.
+        $script:DefaultStockLines = @(
+            '',
+            '[Configuration]',
+            'BasedOn=..\Engine\Config\BaseEngine.ini',
+            '',
+            '[SystemSettings]',
+            'ResX=0',
+            'ResY=0',
+            'TEXTUREGROUP_World=(MinLODSize=256,MaxLODSize=1024,LODBias=1,MinMagFilter=aniso,MipFilter=point)',
+            'TEXTUREGROUP_UI=(MinLODSize=512,MaxLODSize=1024,LODBias=0,MinMagFilter=linear,MipFilter=point)',
+            '',
+            '[SystemSettingsEditor]',
+            'TEXTUREGROUP_World=(MinLODSize=256,MaxLODSize=1024,LODBias=1,MinMagFilter=aniso,MipFilter=point)'
+        )
+        $script:DefaultPatchedLines = $script:DefaultStockLines.Clone()
+        $script:DefaultPatchedLines[7] = 'TEXTUREGROUP_World=(MinLODSize=256,MaxLODSize=1024,LODBias=1,MinMagFilter=aniso,MipFilter=aniso)'
+        $script:DefaultPatchedLines[8] = 'TEXTUREGROUP_UI=(MinLODSize=512,MaxLODSize=1024,LODBias=0,MinMagFilter=linear,MipFilter=aniso)'
+        # Enemy Within's own sizes differ; they must survive the patch.
+        $script:DefaultEwStockLines = $script:DefaultStockLines.Clone()
+        $script:DefaultEwStockLines[7] = 'TEXTUREGROUP_World=(MinLODSize=256,MaxLODSize=1024,LODBias=0,MinMagFilter=aniso,MipFilter=point)'
+        $script:DefaultOverlayText = Join-Lines @(
+            '[SystemSettings]',
+            '; World textures: filter between mipmap levels',
+            'TEXTUREGROUP_World.MipFilter=aniso',
+            'TEXTUREGROUP_UI.MipFilter=aniso'
+        )
+        $script:DefaultOverlay = ConvertFrom-OverlayText $script:DefaultOverlayText
+
+        # Fake install: for each game, Engine\Config\BaseEngine.ini and
+        # XComGame\Config\DefaultEngine.ini, under <root> and <root>\XEW.
+        function New-FakeInstall([switch]$NoXew, [switch]$NoDefaultEngine, [string]$EuText, [string]$EwText, [string]$EuDefaultText, [string]$EwDefaultText) {
             $base = New-TestFolder
             $root = Join-Path $base 'XCom-Enemy-Unknown'
             if (-not $EuText) { $EuText = Join-Lines $script:StockLines }
             if (-not $EwText) { $EwText = Join-Lines ($script:StockLines + @('', '[Extra]', 'OnlyInEW=1')) }
-            $eu = Join-Path $root 'Engine\Config'
-            New-Item -ItemType Directory -Path $eu -Force | Out-Null
-            [IO.File]::WriteAllBytes((Join-Path $eu 'BaseEngine.ini'), (Get-Latin1Bytes $EuText))
-            if (-not $NoXew) {
-                $ew = Join-Path $root 'XEW\Engine\Config'
-                New-Item -ItemType Directory -Path $ew -Force | Out-Null
-                [IO.File]::WriteAllBytes((Join-Path $ew 'BaseEngine.ini'), (Get-Latin1Bytes $EwText))
+            if (-not $EuDefaultText) { $EuDefaultText = Join-Lines $script:DefaultStockLines }
+            if (-not $EwDefaultText) { $EwDefaultText = Join-Lines $script:DefaultEwStockLines }
+            $games = @(@{ Dir = $root; Base = $EuText; Default = $EuDefaultText })
+            if (-not $NoXew) { $games += @{ Dir = (Join-Path $root 'XEW'); Base = $EwText; Default = $EwDefaultText } }
+            foreach ($g in $games) {
+                New-Item -ItemType Directory -Path (Join-Path $g.Dir 'Engine\Config') -Force | Out-Null
+                [IO.File]::WriteAllBytes((Join-Path $g.Dir 'Engine\Config\BaseEngine.ini'), (Get-Latin1Bytes $g.Base))
+                if (-not $NoDefaultEngine) {
+                    New-Item -ItemType Directory -Path (Join-Path $g.Dir 'XComGame\Config') -Force | Out-Null
+                    [IO.File]::WriteAllBytes((Join-Path $g.Dir 'XComGame\Config\DefaultEngine.ini'), (Get-Latin1Bytes $g.Default))
+                }
             }
-            $overlayPath = Join-Path $base 'settings.ini'
+            $overlayPath = Join-Path $base 'base-engine.ini'
             [IO.File]::WriteAllBytes($overlayPath, (Get-Latin1Bytes $script:OverlayText))
+            $defaultOverlayPath = Join-Path $base 'default-engine.ini'
+            [IO.File]::WriteAllBytes($defaultOverlayPath, (Get-Latin1Bytes $script:DefaultOverlayText))
+            $documents = Join-Path $base 'Documents'
+            New-Item -ItemType Directory -Path $documents | Out-Null
             return [pscustomobject]@{
-                Root    = $root
-                EuFile  = Join-Path $root 'Engine\Config\BaseEngine.ini'
-                EwFile  = Join-Path $root 'XEW\Engine\Config\BaseEngine.ini'
-                Overlay = $overlayPath
-                Backup  = Join-Path $base 'backup'
+                Root           = $root
+                EuFile         = Join-Path $root 'Engine\Config\BaseEngine.ini'
+                EwFile         = Join-Path $root 'XEW\Engine\Config\BaseEngine.ini'
+                EuDefault      = Join-Path $root 'XComGame\Config\DefaultEngine.ini'
+                EwDefault      = Join-Path $root 'XEW\XComGame\Config\DefaultEngine.ini'
+                Overlay        = $overlayPath
+                DefaultOverlay = $defaultOverlayPath
+                Backup         = Join-Path $base 'backup'
+                Documents      = $documents
             }
+        }
+
+        function Get-FileState([string]$Path, $Overlay) {
+            return (Get-IniState -Text ([IO.File]::ReadAllText($Path)) -Overlay $Overlay).State
         }
 
         # Runs the CLI entry point and returns its exit code and everything it printed.
         function Invoke-Cli($Install, [string[]]$Arguments, [scriptblock]$IsGameRunning = { $false }) {
-            $records = & { Invoke-Main -Arguments $Arguments -OverlayPath $Install.Overlay -BackupRoot $Install.Backup -IsGameRunning $IsGameRunning } 6>&1
+            $records = & { Invoke-Main -Arguments $Arguments -BaseEngineOverlayPath $Install.Overlay -DefaultEngineOverlayPath $Install.DefaultOverlay -BackupRoot $Install.Backup -DocumentsRoot $Install.Documents -IsGameRunning $IsGameRunning } 6>&1
             $code = $null
             $lines = New-Object System.Collections.Generic.List[string]
             foreach ($r in $records) {
@@ -334,10 +381,10 @@ Describe 'graphics-settings apply.ps1' {
             Assert-Throws { ConvertFrom-OverlayText (Join-Lines @('; nothing')) } 'no settings'
         }
 
-        It 'parses the shipped settings.ini' {
-            $path = Join-Path (Split-Path -Parent $PSScriptRoot) 'settings.ini'
+        It 'parses the shipped base-engine.ini' {
+            $path = Join-Path (Split-Path -Parent $PSScriptRoot) 'base-engine.ini'
             $entries = @(Read-Overlay -Path $path)
-            Assert-True ($entries.Count -gt 0) 'settings.ini has entries'
+            Assert-True ($entries.Count -gt 0) 'base-engine.ini has entries'
         }
     }
 
@@ -639,8 +686,8 @@ Describe 'graphics-settings apply.ps1' {
             $ew = Get-Sha256 $i.EwFile
             $r = Invoke-Cli $i @('status', '--game-dir', $i.Root)
             Assert-Equal 0 $r.Code $r.Output
-            Assert-True ($r.Output -match 'Enemy Unknown\s*:\s*patched') $r.Output
-            Assert-True ($r.Output -match 'Enemy Within\s*:\s*stock') $r.Output
+            Assert-True ($r.Output -match 'Enemy Unknown\s+BaseEngine\.ini\s*:\s*patched \(backup: yes\)\s+DefaultEngine\.ini\s*:\s*patched \(backup: yes\)') $r.Output
+            Assert-True ($r.Output -match 'Enemy Within\s+BaseEngine\.ini\s*:\s*stock \(backup: no\)\s+DefaultEngine\.ini\s*:\s*stock \(backup: no\)') $r.Output
             Assert-Equal $eu (Get-Sha256 $i.EuFile)
             Assert-Equal $ew (Get-Sha256 $i.EwFile)
         }
@@ -650,6 +697,328 @@ Describe 'graphics-settings apply.ps1' {
             $r = Invoke-Cli $i @('status', '--game-dir', $i.Root)
             Assert-Equal 0 $r.Code $r.Output
             Assert-True ($r.Output -match 'Enemy Within\s*:\s*not installed') $r.Output
+        }
+    }
+
+    Context 'Field entries (Key.Field=Value): overlay parsing' {
+
+        It 'reads the key, the field and the value' {
+            $entries = @(ConvertFrom-OverlayText (Join-Lines @('[SystemSettings]', 'TEXTUREGROUP_World.MipFilter = aniso')))
+            Assert-Equal 1 $entries.Count
+            Assert-Equal 'SystemSettings' $entries[0].Section
+            Assert-Equal 'TEXTUREGROUP_World' $entries[0].Key
+            Assert-Equal 'MipFilter' $entries[0].Field
+            Assert-Equal 'aniso' $entries[0].Value
+        }
+
+        It 'leaves Field empty for a plain Key=Value' {
+            $entries = @(ConvertFrom-OverlayText (Join-Lines @('[A]', 'K=V')))
+            Assert-True ($null -eq $entries[0].Field) 'Field is $null'
+        }
+
+        It 'rejects an empty field name or more than one dot' {
+            Assert-Throws { ConvertFrom-OverlayText (Join-Lines @('[A]', 'K.=1')) } 'Key.Field'
+            Assert-Throws { ConvertFrom-OverlayText (Join-Lines @('[A]', 'K.F.G=1')) } 'Key.Field'
+        }
+
+        It 'rejects the same field twice' {
+            Assert-Throws { ConvertFrom-OverlayText (Join-Lines @('[A]', 'K.F=1', 'k.f=2')) } 'more than once'
+        }
+
+        It 'rejects a key set both as a whole and by field' {
+            Assert-Throws { ConvertFrom-OverlayText (Join-Lines @('[A]', 'K=(F=1)', 'K.F=2')) } 'both as a whole and by field'
+        }
+
+        It 'parses the shipped default-engine.ini' {
+            $path = Join-Path (Split-Path -Parent $PSScriptRoot) 'default-engine.ini'
+            $entries = @(Read-Overlay -Path $path)
+            Assert-True ($entries.Count -gt 0) 'default-engine.ini has entries'
+            foreach ($e in $entries) {
+                Assert-Equal 'MipFilter' $e.Field "$($e.Key) edits MipFilter"
+                Assert-Equal 'linear' $e.Value "$($e.Key) uses linear (trilinear) mip filtering"
+            }
+        }
+    }
+
+    Context 'Field entries: merge and state' {
+
+        It 'changes only the field, leaving the rest of the line and other sections byte-identical' {
+            $merged = Merge-IniText -Text (Join-Lines $script:DefaultStockLines) -Overlay $script:DefaultOverlay
+            Assert-Equal (Join-Lines $script:DefaultPatchedLines) $merged
+        }
+
+        It 'keeps the spacing inside the struct' {
+            $overlay = ConvertFrom-OverlayText (Join-Lines @('[S]', 'T.MipFilter=aniso'))
+            $merged = Merge-IniText -Text (Join-Lines @('[S]', 'T = ( MinLODSize = 256 , MipFilter = point )')) -Overlay $overlay
+            Assert-Equal (Join-Lines @('[S]', 'T = ( MinLODSize = 256 , MipFilter = aniso )')) $merged
+        }
+
+        It 'matches the field name case-insensitively and keeps its spelling' {
+            $overlay = ConvertFrom-OverlayText (Join-Lines @('[S]', 'T.MipFilter=aniso'))
+            $merged = Merge-IniText -Text (Join-Lines @('[S]', 'T=(mipfilter=Point)')) -Overlay $overlay
+            Assert-Equal (Join-Lines @('[S]', 'T=(mipfilter=aniso)')) $merged
+        }
+
+        It 'only changes the top-level field, not one nested or inside quotes' {
+            $overlay = ConvertFrom-OverlayText (Join-Lines @('[S]', 'T.MipFilter=aniso'))
+            $text = Join-Lines @('[S]', 'T=(A=(B=1,MipFilter=x),Name="a,MipFilter=q",MipFilter=point)')
+            $merged = Merge-IniText -Text $text -Overlay $overlay
+            Assert-Equal (Join-Lines @('[S]', 'T=(A=(B=1,MipFilter=x),Name="a,MipFilter=q",MipFilter=aniso)')) $merged
+        }
+
+        It 'is idempotent' {
+            $once = Merge-IniText -Text (Join-Lines $script:DefaultStockLines) -Overlay $script:DefaultOverlay
+            Assert-Equal $once (Merge-IniText -Text $once -Overlay $script:DefaultOverlay)
+        }
+
+        It 'refuses a value that has no such field' {
+            $overlay = ConvertFrom-OverlayText (Join-Lines @('[S]', 'T.MipFilter=aniso'))
+            Assert-Throws { Merge-IniText -Text (Join-Lines @('[S]', 'T=(MinLODSize=1)')) -Overlay $overlay } 'has no MipFilter field'
+        }
+
+        It 'refuses a field that appears twice at the top level' {
+            $overlay = ConvertFrom-OverlayText (Join-Lines @('[S]', 'T.MipFilter=aniso'))
+            Assert-Throws { Merge-IniText -Text (Join-Lines @('[S]', 'T=(MipFilter=a,MipFilter=b)')) -Overlay $overlay } 'appears 2 times'
+        }
+
+        It 'refuses a value that is not a (...) struct' {
+            $overlay = ConvertFrom-OverlayText (Join-Lines @('[S]', 'T.MipFilter=aniso'))
+            Assert-Throws { Merge-IniText -Text (Join-Lines @('[S]', 'T=point')) -Overlay $overlay } 'not a (...) value'
+            Assert-Throws { Merge-IniText -Text (Join-Lines @('[S]', 'T=(MipFilter=point) trailing')) -Overlay $overlay } 'not a (...) value'
+        }
+
+        It 'never inserts: a missing key or section is an error' {
+            $overlay = ConvertFrom-OverlayText (Join-Lines @('[S]', 'T.MipFilter=aniso'))
+            Assert-Throws { Merge-IniText -Text (Join-Lines @('[S]', 'Other=1')) -Overlay $overlay } 'not found'
+            Assert-Throws { Merge-IniText -Text (Join-Lines @('[Other]', 'T=(MipFilter=point)')) -Overlay $overlay } 'not found'
+        }
+
+        It 'detects stock, patched and partial' {
+            Assert-Equal 'stock' (Get-IniState -Text (Join-Lines $script:DefaultStockLines) -Overlay $script:DefaultOverlay).State
+            Assert-Equal 'patched' (Get-IniState -Text (Join-Lines $script:DefaultPatchedLines) -Overlay $script:DefaultOverlay).State
+            $lines = $script:DefaultStockLines.Clone()
+            $lines[8] = $script:DefaultPatchedLines[8]
+            $state = Get-IniState -Text (Join-Lines $lines) -Overlay $script:DefaultOverlay
+            Assert-Equal 'partial' $state.State
+            Assert-Equal 1 $state.Present
+        }
+
+        It 'keeps a leading blank line and CRLF line endings when writing' {
+            $dir = New-TestFolder
+            $path = Join-Path $dir 'DefaultEngine.ini'
+            [IO.File]::WriteAllBytes($path, (Get-Latin1Bytes (Join-Lines $script:DefaultStockLines)))
+            Update-IniFile -Path $path -Overlay $script:DefaultOverlay | Out-Null
+            Assert-BytesEqual (Get-Latin1Bytes (Join-Lines $script:DefaultPatchedLines)) ([IO.File]::ReadAllBytes($path))
+        }
+    }
+
+    Context 'apply, restore and status with DefaultEngine.ini' {
+
+        It 'patches both files of both games and backs up each stock file' {
+            $i = New-FakeInstall
+            $stock = @{}
+            foreach ($p in $i.EuFile, $i.EwFile, $i.EuDefault, $i.EwDefault) { $stock[$p] = Get-Sha256 $p }
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root, '--quiet')
+            Assert-Equal 0 $r.Code $r.Output
+            Assert-Equal 'patched' (Get-FileState $i.EuDefault $script:DefaultOverlay)
+            Assert-Equal 'patched' (Get-FileState $i.EwDefault $script:DefaultOverlay)
+            Assert-Equal $stock[$i.EuFile] (Get-Sha256 (Join-Path $i.Backup 'enemy-unknown\BaseEngine.ini'))
+            Assert-Equal $stock[$i.EuDefault] (Get-Sha256 (Join-Path $i.Backup 'enemy-unknown\DefaultEngine.ini'))
+            Assert-Equal $stock[$i.EwFile] (Get-Sha256 (Join-Path $i.Backup 'enemy-within\BaseEngine.ini'))
+            Assert-Equal $stock[$i.EwDefault] (Get-Sha256 (Join-Path $i.Backup 'enemy-within\DefaultEngine.ini'))
+        }
+
+        It 'keeps each game''s own texture sizes' {
+            $i = New-FakeInstall
+            Invoke-Cli $i @('apply', '--game-dir', $i.Root, '--quiet') | Out-Null
+            $ew = [IO.File]::ReadAllText($i.EwDefault)
+            Assert-True ($ew.Contains('TEXTUREGROUP_World=(MinLODSize=256,MaxLODSize=1024,LODBias=0,MinMagFilter=aniso,MipFilter=aniso)')) $ew
+            $eu = [IO.File]::ReadAllText($i.EuDefault)
+            Assert-True ($eu.Contains('TEXTUREGROUP_World=(MinLODSize=256,MaxLODSize=1024,LODBias=1,MinMagFilter=aniso,MipFilter=aniso)')) $eu
+        }
+
+        It 'upgrades an install from an earlier version: patches only DefaultEngine.ini and keeps the BaseEngine.ini backup' {
+            $i = New-FakeInstall -NoXew -EuText (Join-Lines $script:PatchedLines)
+            $baseBackup = Join-Path $i.Backup 'enemy-unknown\BaseEngine.ini'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $baseBackup) -Force | Out-Null
+            [IO.File]::WriteAllBytes($baseBackup, (Get-Latin1Bytes (Join-Lines $script:StockLines)))
+            $baseBefore = Get-Sha256 $i.EuFile
+            $defaultStock = Get-Sha256 $i.EuDefault
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root)
+            Assert-Equal 0 $r.Code $r.Output
+            Assert-True ($r.Output -match 'BaseEngine\.ini: already patched') $r.Output
+            Assert-Equal $baseBefore (Get-Sha256 $i.EuFile)
+            Assert-Equal 'patched' (Get-FileState $i.EuDefault $script:DefaultOverlay)
+            Assert-Equal $defaultStock (Get-Sha256 (Join-Path $i.Backup 'enemy-unknown\DefaultEngine.ini'))
+            Assert-Equal (Get-Sha256Hex (Get-Latin1Bytes (Join-Lines $script:StockLines))) (Get-Sha256 $baseBackup)
+        }
+
+        It 'handles each file on its own: a refused file does not stop the other' {
+            $lines = $script:DefaultStockLines.Clone()
+            $lines[8] = $script:DefaultPatchedLines[8]
+            $i = New-FakeInstall -NoXew -EuDefaultText (Join-Lines $lines)
+            $defaultBefore = Get-Sha256 $i.EuDefault
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root)
+            Assert-Equal 1 $r.Code
+            Assert-True ($r.Output -match 'DefaultEngine\.ini is partially patched') $r.Output
+            Assert-Equal $defaultBefore (Get-Sha256 $i.EuDefault)
+            Assert-Equal 'patched' (Get-FileState $i.EuFile $script:Overlay)
+        }
+
+        It 'fails for a game whose DefaultEngine.ini is missing' {
+            $i = New-FakeInstall -NoXew -NoDefaultEngine
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root)
+            Assert-Equal 1 $r.Code
+            Assert-True ($r.Output -match 'DefaultEngine\.ini.*not found') $r.Output
+        }
+
+        It 'restores both files byte-for-byte' {
+            $i = New-FakeInstall
+            $stock = @{}
+            foreach ($p in $i.EuFile, $i.EwFile, $i.EuDefault, $i.EwDefault) { $stock[$p] = Get-Sha256 $p }
+            Invoke-Cli $i @('apply', '--game-dir', $i.Root, '--quiet') | Out-Null
+            $r = Invoke-Cli $i @('restore', '--game-dir', $i.Root, '--quiet')
+            Assert-Equal 0 $r.Code $r.Output
+            foreach ($p in $stock.Keys) { Assert-Equal $stock[$p] (Get-Sha256 $p) $p }
+        }
+
+        It 'tells you the game will rebuild its per-user settings after a change' {
+            $i = New-FakeInstall -NoXew
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root)
+            Assert-True ($r.Output -like '*resets your resolution and graphics options*') $r.Output
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root)
+            Assert-True ($r.Output -notlike '*resets your resolution and graphics options*') 'no reminder when nothing changed'
+        }
+    }
+
+    Context 'a file patched with other values for the same settings (e.g. an earlier version)' {
+
+        BeforeAll {
+            # DefaultEngine.ini as an earlier version of the patch left it: same lines, other MipFilter.
+            $script:DefaultOtherLines = $script:DefaultStockLines.Clone()
+            $script:DefaultOtherLines[7] = $script:DefaultStockLines[7].Replace('MipFilter=point', 'MipFilter=linear')
+            $script:DefaultOtherLines[8] = $script:DefaultStockLines[8].Replace('MipFilter=point', 'MipFilter=linear')
+
+            function Set-Backup($Install, [string]$Game, [string]$Name, [string]$Text) {
+                $path = Join-Path $Install.Backup "$Game\$Name"
+                New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+                [IO.File]::WriteAllBytes($path, (Get-Latin1Bytes $Text))
+                return $path
+            }
+        }
+
+        It 'refuses to apply, and keeps the stock backup' {
+            $i = New-FakeInstall -NoXew -EuDefaultText (Join-Lines $script:DefaultOtherLines)
+            $backup = Set-Backup $i 'enemy-unknown' 'DefaultEngine.ini' (Join-Lines $script:DefaultStockLines)
+            $stockHash = Get-Sha256 $backup
+            $before = Get-Sha256 $i.EuDefault
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root)
+            Assert-Equal 1 $r.Code
+            Assert-True ($r.Output -match 'DefaultEngine\.ini has other values for this patch''s settings') $r.Output
+            Assert-True ($r.Output -like '*Restore.cmd*') $r.Output
+            Assert-Equal $before (Get-Sha256 $i.EuDefault)
+            Assert-Equal $stockHash (Get-Sha256 $backup)
+        }
+
+        It 'restores the stock backup over it' {
+            $i = New-FakeInstall -NoXew -EuDefaultText (Join-Lines $script:DefaultOtherLines)
+            $backup = Set-Backup $i 'enemy-unknown' 'DefaultEngine.ini' (Join-Lines $script:DefaultStockLines)
+            $r = Invoke-Cli $i @('restore', '--game-dir', $i.Root)
+            Assert-Equal 0 $r.Code $r.Output
+            Assert-Equal (Get-Sha256 $backup) (Get-Sha256 $i.EuDefault)
+        }
+
+        It 'then applies cleanly after the restore' {
+            $i = New-FakeInstall -NoXew -EuDefaultText (Join-Lines $script:DefaultOtherLines)
+            Set-Backup $i 'enemy-unknown' 'DefaultEngine.ini' (Join-Lines $script:DefaultStockLines) | Out-Null
+            Invoke-Cli $i @('restore', '--game-dir', $i.Root, '--quiet') | Out-Null
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root, '--quiet')
+            Assert-Equal 0 $r.Code $r.Output
+            Assert-Equal 'patched' (Get-FileState $i.EuDefault $script:DefaultOverlay)
+        }
+
+        It 'still treats a file that also differs elsewhere as a new stock file (a game update)' {
+            $updated = Join-Lines ($script:DefaultStockLines + @('', '[NewInUpdate]', 'A=1'))
+            $i = New-FakeInstall -NoXew -EuDefaultText $updated
+            $backup = Set-Backup $i 'enemy-unknown' 'DefaultEngine.ini' (Join-Lines $script:DefaultStockLines)
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root, '--quiet')
+            Assert-Equal 0 $r.Code $r.Output
+            Assert-Equal (Get-Sha256Hex (Get-Latin1Bytes $updated)) (Get-Sha256 $backup)
+            Assert-Equal 'patched' (Get-FileState $i.EuDefault $script:DefaultOverlay)
+        }
+
+        It 'is reported by status, not shown as stock' {
+            $i = New-FakeInstall -NoXew -EuDefaultText (Join-Lines $script:DefaultOtherLines)
+            Set-Backup $i 'enemy-unknown' 'DefaultEngine.ini' (Join-Lines $script:DefaultStockLines) | Out-Null
+            $r = Invoke-Cli $i @('status', '--game-dir', $i.Root)
+            Assert-Equal 0 $r.Code $r.Output
+            Assert-True ($r.Output -match 'DefaultEngine\.ini\s*:\s*patched with other values .*Restore\.cmd.*Apply\.cmd') $r.Output
+            Assert-True ($r.Output -match 'BaseEngine\.ini\s*:\s*stock \(backup: no\)') $r.Output
+        }
+
+        It 'works the same for plain Key=Value settings' {
+            $other = $script:StockLines.Clone()
+            $other[15] = 'MaxAnisotropy=8'
+            $i = New-FakeInstall -NoXew -EuText (Join-Lines $other)
+            $backup = Set-Backup $i 'enemy-unknown' 'BaseEngine.ini' (Join-Lines $script:StockLines)
+            $stockHash = Get-Sha256 $backup
+            $r = Invoke-Cli $i @('apply', '--game-dir', $i.Root)
+            Assert-Equal 1 $r.Code
+            Assert-True ($r.Output -match 'BaseEngine\.ini has other values') $r.Output
+            Assert-Equal $stockHash (Get-Sha256 $backup)
+        }
+    }
+
+    Context 'status note on XComEngine.ini' {
+
+        BeforeAll {
+            function New-UserConfig($Install, [string]$Folder, [datetime]$Time) {
+                $dir = Join-Path $Install.Documents "My Games\$Folder\XComGame\Config"
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                $path = Join-Path $dir 'XComEngine.ini'
+                [IO.File]::WriteAllText($path, "[IniVersion]`r`n")
+                (Get-Item -LiteralPath $path).LastWriteTime = $Time
+                return $path
+            }
+        }
+
+        It 'says when XComEngine.ini has not been created yet' {
+            $i = New-FakeInstall -NoXew
+            $r = Invoke-Cli $i @('status', '--game-dir', $i.Root)
+            Assert-True ($r.Output -match 'XComEngine\.ini\s*:\s*not created yet') $r.Output
+        }
+
+        It 'says when the game will rebuild XComEngine.ini on the next launch' {
+            $i = New-FakeInstall -NoXew
+            New-UserConfig $i 'XCOM - Enemy Unknown' (Get-Date).AddDays(-1) | Out-Null
+            $r = Invoke-Cli $i @('status', '--game-dir', $i.Root)
+            Assert-True ($r.Output -match 'XComEngine\.ini\s*:\s*older than') $r.Output
+        }
+
+        It 'says when XComEngine.ini is newer, so in-game options override the patch' {
+            $i = New-FakeInstall -NoXew
+            New-UserConfig $i 'XCOM - Enemy Unknown' (Get-Date).AddDays(1) | Out-Null
+            $r = Invoke-Cli $i @('status', '--game-dir', $i.Root)
+            Assert-True ($r.Output -match 'XComEngine\.ini\s*:\s*newer than') $r.Output
+        }
+
+        It 'looks in the Enemy Within folder for Enemy Within' {
+            $i = New-FakeInstall
+            New-UserConfig $i 'XCOM - Enemy Within' (Get-Date).AddDays(1) | Out-Null
+            $r = Invoke-Cli $i @('status', '--game-dir', $i.Root)
+            Assert-True ($r.Output -match 'Enemy Unknown[\s\S]*XComEngine\.ini\s*:\s*not created yet[\s\S]*Enemy Within[\s\S]*XComEngine\.ini\s*:\s*newer than') $r.Output
+        }
+
+        It 'never writes to XComEngine.ini' {
+            $i = New-FakeInstall -NoXew
+            $path = New-UserConfig $i 'XCOM - Enemy Unknown' (Get-Date).AddDays(-1)
+            $before = Get-Sha256 $path
+            $stamp = (Get-Item -LiteralPath $path).LastWriteTime
+            Invoke-Cli $i @('apply', '--game-dir', $i.Root, '--quiet') | Out-Null
+            Invoke-Cli $i @('status', '--game-dir', $i.Root) | Out-Null
+            Invoke-Cli $i @('restore', '--game-dir', $i.Root, '--quiet') | Out-Null
+            Assert-Equal $before (Get-Sha256 $path)
+            Assert-Equal $stamp (Get-Item -LiteralPath $path).LastWriteTime
         }
     }
 }
